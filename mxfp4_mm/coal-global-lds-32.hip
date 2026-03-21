@@ -50,64 +50,67 @@ void mxfp4_gemm_kernel(
     int global_m = cRow * BLOCKSIZE + row_in_tile;
     int global_n = cCol * BLOCKSIZE + row_in_tile;
 
-    // pointers advanced to starting positions
-    const fp4x2_t* a_ptr = A + (cRow * BLOCKSIZE) * K/2;
-    const fp4x2_t* b_ptr = B + (cCol * BLOCKSIZE) * K/2;
-    // const __hip_bfloat16* C += cRow * BLOCKSIZE * N + cCol * BLOCKSIZE;
-
-    // pointers advanced to strating scale positions
-    const uint8_t* a_scale_ptr = A_scale + (cRow * BLOCKSIZE) * K/32;
-    const uint8_t* b_scale_ptr = B_scale + (cCol * BLOCKSIZE) * K/32;
-
-    // // stride = number of bytes per row in the input tile
-    // const int stride = TILE_K / 2;
-    // // scale_stride; one scale value per 32 elements 
-    // const int scale_stride = TILE_K / 32;\
+    const int K_half = K / 2;     // bytes per row in A/B
+    const int K_scale = K / 32;   // scale bytes per row
 
     //acc registers
-    fp32x16_t c_reg = {};    
+    fp32x16_t c_reg = {};
 
     // loop over the K dimension
     for (int bkIdx = 0; bkIdx < K; bkIdx += TILE_K) {
 
-        const fp4x2_t* a_row = a_ptr + (row_in_tile * K/2);
-        const fp4x2_t* b_row = b_ptr + (row_in_tile * K/2);
-        
-        //load A_tile : global to lds
-        if (global_m < M) {
-            const fp4x32_t a_vec = load_fp4x32(a_row + k_byte_offset);
-            *reinterpret_cast<fp4x32_t*>(&A_tile[row_in_tile][k_byte_offset]) = a_vec;
-        } else {
-            *reinterpret_cast<fp4x32_t*>(&A_tile[row_in_tile][k_byte_offset]) = {};
+        // --- Coalesced global → LDS loads ---
+        // A_tile is 32 rows × 32 bytes = 1024 bytes total
+        // 64 lanes × 16 bytes each = 1024 bytes — one load covers the whole tile
+        // Lane i loads 16 bytes starting at flat byte offset i*16
+        {
+            const int flat_offset = lane * 16;              // [0, 1008] step 16
+            const int lds_row = flat_offset / (TILE_K / 2); // which row in tile (0-31)
+            const int lds_col = flat_offset % (TILE_K / 2); // byte offset within row (0 or 16)
+            const int gm = cRow * BLOCKSIZE + lds_row;
+            if (gm < M) {
+                const fp4x32_t a_vec = load_fp4x32(A + gm * K_half + (bkIdx / 2) + lds_col);
+                *reinterpret_cast<fp4x32_t*>(&A_tile[lds_row][lds_col]) = a_vec;
+            } else {
+                *reinterpret_cast<fp4x32_t*>(&A_tile[lds_row][lds_col]) = {};
+            }
         }
+        {
+            const int flat_offset = lane * 16;
+            const int lds_row = flat_offset / (TILE_K / 2);
+            const int lds_col = flat_offset % (TILE_K / 2);
+            const int gn = cCol * BLOCKSIZE + lds_row;
+            if (gn < N) {
+                const fp4x32_t b_vec = load_fp4x32(B + gn * K_half + (bkIdx / 2) + lds_col);
+                *reinterpret_cast<fp4x32_t*>(&B_tile[lds_row][lds_col]) = b_vec;
+            } else {
+                *reinterpret_cast<fp4x32_t*>(&B_tile[lds_row][lds_col]) = {};
+            }
 
-        // load b_tile : global to lds
-        if (global_n < N) {
-            const fp4x32_t b_vec = load_fp4x32(b_row + k_byte_offset);
-            *reinterpret_cast<fp4x32_t*>(&B_tile[row_in_tile][k_byte_offset]) = b_vec;
-        } else {
-            *reinterpret_cast<fp4x32_t*>(&B_tile[row_in_tile][k_byte_offset]) = {};
+        // Scales: A_scale_tile is 32 rows × 2 bytes = 64 bytes
+        // 64 lanes, each loads 1 byte
+        {
+            const int scl_row = lane / 2;   // 0-31
+            const int scl_col = lane % 2;   // 0 or 1
+            const int gm = cRow * BLOCKSIZE + scl_row;
+            if (gm < M) {
+                A_scale_tile[scl_row][scl_col] = A_scale[gm * K_scale + (bkIdx / 32) + scl_col];
+            } else {
+                A_scale_tile[scl_row][scl_col] = 0;
+            }
         }
-
-        //load scales
-        if (global_m < M) {
-            A_scale_tile[row_in_tile][row_group] = a_scale_ptr[row_in_tile * K/32 + row_group];
-        } else {
-            A_scale_tile[row_in_tile][row_group] = 0;
-        }
-
-        if (global_n < N) {
-            B_scale_tile[row_in_tile][row_group] = b_scale_ptr[row_in_tile * K/32 + row_group];
-        } else {
-            B_scale_tile[row_in_tile][row_group] = 0;
+        {
+            const int scl_row = lane / 2;
+            const int scl_col = lane % 2;
+            const int gn = cCol * BLOCKSIZE + scl_row;
+            if (gn < N) {
+                B_scale_tile[scl_row][scl_col] = B_scale[gn * K_scale + (bkIdx / 32) + scl_col];
+            } else {
+                B_scale_tile[scl_row][scl_col] = 0;
+            }
         }
 
         __syncthreads();
-
-        a_ptr += TILE_K/2;
-        b_ptr += TILE_K/2;
-        a_scale_ptr += TILE_K/32;
-        b_scale_ptr += TILE_K/32;
 
         fp4x64_t a_reg {};
         fp4x64_t b_reg {};
@@ -151,6 +154,8 @@ void mxfp4_gemm_kernel(
         }
 }
 
+}
+
 void mxfp4_gemm(
     torch::Tensor A_q, torch::Tensor B_q,
     torch::Tensor A_scale, torch::Tensor B_scale,
@@ -169,29 +174,31 @@ void mxfp4_gemm(
 }
 
 
-## Benchmarks:
-```
-k: 512; m: 4; n: 2880; seed: 4565
- ⏱ 22.6 ± 0.02 µs
- ⚡ 21.8 µs 🐌 29.5 µs
+// EXTRA ALU eats the GAINs by lane pairwise coalescing
+// ## Benchmarks:
+// ```
+// k: 512; m: 4; n: 2880; seed: 4565
+//  ⏱ 23.8 ± 0.03 µs
+//  ⚡ 23.0 µs 🐌 32.2 µs
 
-k: 7168; m: 16; n: 2112; seed: 15
- ⏱ 89.9 ± 0.09 µs
- ⚡ 88.5 µs 🐌 92.7 µs
+// k: 7168; m: 16; n: 2112; seed: 15
+//  ⏱ 115 ± 0.1 µs
+//  ⚡ 113 µs 🐌 118 µs
 
-k: 512; m: 32; n: 4096; seed: 457
- ⏱ 23.7 ± 0.02 µs
- ⚡ 22.9 µs 🐌 28.9 µs
+// k: 512; m: 32; n: 4096; seed: 457
+//  ⏱ 25.4 ± 0.03 µs
+//  ⚡ 24.5 µs 🐌 32.1 µs
 
-k: 512; m: 32; n: 2880; seed: 54
- ⏱ 23.2 ± 0.02 µs
- ⚡ 22.4 µs 🐌 28.5 µs
+// k: 512; m: 32; n: 2880; seed: 54
+//  ⏱ 25.1 ± 0.03 µs
+//  ⚡ 24.2 µs 🐌 30.0 µs
 
-k: 2048; m: 64; n: 7168; seed: 687
- ⏱ 50.0 ± 0.05 µs
- ⚡ 48.8 µs 🐌 55.2 µs
+// k: 2048; m: 64; n: 7168; seed: 687
+//  ⏱ 62.1 ± 0.06 µs
+//  ⚡ 60.8 µs 🐌 69.4 µs
 
-k: 1536; m: 256; n: 3072; seed: 7856
- ⏱ 41.6 ± 0.04 µs
- ⚡ 40.6 µs 🐌 46.9 µs
-```
+// k: 1536; m: 256; n: 3072; seed: 7856
+//  ⏱ 50.2 ± 0.05 µs
+//  ⚡ 49.0 µs 🐌 55.3 µs
+// ```
+

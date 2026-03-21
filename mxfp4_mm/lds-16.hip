@@ -32,8 +32,8 @@ void mxfp4_gemm_kernel(
     const int K
 )  {
 
-    __shared__ uint8_t A_tile[TILE_M][TILE_K / 2];
-    __shared__ uint8_t B_tile[TILE_N][TILE_K / 2];
+    __shared__ uint8_t A_tile[TILE_M][TILE_K / 2];         // [16][64] 
+    __shared__ uint8_t B_tile[TILE_N][TILE_K / 2];         // [16][64]
 
     __shared__ uint8_t A_scale_tile[TILE_M][TILE_K / 32];  // [16][4]
     __shared__ uint8_t B_scale_tile[TILE_N][TILE_K / 32];  // [16][4]
