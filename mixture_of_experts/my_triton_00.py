@@ -316,13 +316,15 @@ def expert_kernel(
     offs_b2n = tl.where(offs_b2n < d_expert, offs_b2n, 0)
     offs_k = tl.arange(0, BLOCKSIZE_K)
 
-    # laod the token ids to be fetched from X
-    token_ids = tl.load(exp_token_idxs + offs_am)
+    # laod the token ids and the expert scores to be fetched from X
+    offs_m_mask = tl.arange(0, BLOCKSIZE_M) < idxs_len - start_m
+    token_ids = tl.load(
+        exp_token_idxs + offs_am
+        )
 
     scales = tl.load(
         exp_weights + offs_am,
-        mask= tl.arange(0, BLOCKSIZE_M) < idxs_len - start_m
-    )
+        )
     
     # Pointer Arithmetic
     a_ptrs = x + (token_ids[:, None] * d_hidden + offs_k[None, :])               # [BM, BK]
@@ -354,13 +356,13 @@ def expert_kernel(
                      mask= offs_k[None, :] < d_hidden - k * BLOCKSIZE_K, other=0.0
                     ).to(tl.float32)
         v = tl.dot(temp,b2, input_precision="ieee")   # [BM, BK]
-        v = v * scales[None, :]         # [BM, BK] * [BM, BK]
+        v = v * scales[:, None]         # [BM, BK] * [BM, BK]
 
         # writing to the out matrix
         tl.atomic_add(
             out + token_ids[:, None] * d_hidden + (k*BLOCKSIZE_K + offs_k[None, :]),
             v,
-            mask= offs_k[None, :] < d_hidden - k * BLOCKSIZE_K,
+            mask=offs_m_mask[:, None] & (offs_k[None, :] < d_hidden - k * BLOCKSIZE_K),
         )
         b2_ptrs += BLOCKSIZE_K
 
@@ -423,7 +425,7 @@ def moe_forward(input_tensor: torch.Tensor,
         expert = experts[expert_id]
         exp_token_idxs = token_idxs[start_idx:end_idx]
 
-        grid = lambda META: (triton.cdiv(exp_token_idxs, META["BLOCK_SIZE_M"]) * triton.cdiv(d_expert, META["BLOCK_SIZE_N"]), )
+        grid = lambda META: (triton.cdiv(len(exp_token_idxs), META["BLOCKSIZE_M"]) * triton.cdiv(d_expert, META["BLOCKSIZE_N"]), )
         expert_kernel[grid](
             expert["w_gate"],
             expert["w_up"],
@@ -438,7 +440,7 @@ def moe_forward(input_tensor: torch.Tensor,
         )
     
     torch.cuda.synchronize()
-    return out + shared_out
+    return (out + shared_out).reshape(batch_size, seq_len, d_hidden)
 
 
 def custom_kernel(data: input_t) -> output_t: # type: ignore
@@ -509,9 +511,17 @@ def profile_moe():
     print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=30))
     prof.export_chrome_trace("moe_profile.json")
 
+def run_test(expect, actual, label, enabled=True):
+    print(f"  {label}: ...", end="")
+    if enabled:
+        passed = torch.allclose(expect, actual.to(expect.dtype), atol=1.0)
+        icon = "✅" if passed else "❌"
+    else:
+        icon = "⭕"
+    print(f"\r  {label}: {icon}  ")
 
 if __name__ == "__main__":
-    torch.cuda.set_device(1)
+    torch.cuda.set_device(0)
     dhidden = 7168
     dexpert = 2048
     nroutedexperts = 8
@@ -542,8 +552,10 @@ if __name__ == "__main__":
     diff = torch.abs(my_moe_out - ref_moe_out)
     print("Reference MoE output shape:", ref_moe_out.shape)
     print("My MoE output shape:", my_moe_out.shape)
+    run_test(my_moe_out, ref_moe_out, "triton")
     print(f"Final difference: {diff}")
+
+    
 
     # profiel the custom kernel
     # profile_moe()
-
