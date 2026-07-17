@@ -7,3 +7,7 @@ mxfp4_mm/AGENTS.md
 HIP_basic/vector_add.S
 */reference/
 mxfp4_mm/submission.py
+mixture_of_experts/task.yml
+mixture_of_experts/daily-checkpoints.md
+mixture_of_experts/__pycache__/*
+*.ipynb

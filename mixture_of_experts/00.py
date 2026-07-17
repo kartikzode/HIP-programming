@@ -8,10 +8,6 @@ from torch.profiler import profile, record_function, ProfilerActivity
 import triton.language as tl
 import triton
 
-## need to rework on the weight matrices, we have written 
-# the pointer arithmatic assuming the shape as
-# [d_hidden, d_expert] but it is wrong.
-
 
 class Expert(nn.Module):
     def __init__(self, config: Dict, d_expert: Optional[int] = None):
@@ -350,11 +346,12 @@ def expert_kernel(
     #SiLu
     gate_acc = gate_acc * tl.sigmoid(gate_acc)
     temp = gate_acc * up_acc        # [BM,BN]
-
+    temp = temp.to(tl.float16)
+    
     for k in range(0, tl.cdiv(d_hidden,BLOCKSIZE_K)):
         b2 = tl.load(b2_ptrs,
                      mask= offs_k[None, :] < d_hidden - k * BLOCKSIZE_K, other=0.0
-                    ).to(tl.float32)
+                    )
         v = tl.dot(temp,b2, input_precision="ieee")   # [BM, BK]
         v = v * scales[:, None]         # [BM, BK] * [BM, BK]
 
@@ -387,7 +384,7 @@ def moe_forward(input_tensor: torch.Tensor,
                 ) -> torch.Tensor:
     
     input_tensor = input_tensor.reshape(-1, d_hidden)
-    out = torch.zeros_like(input_tensor, device= input_tensor.device, dtype=torch.float32)
+    out = torch.zeros_like(input_tensor, device= input_tensor.device, dtype=torch.float16)
 
     num_experts = n_routed_experts
     experts = [{} for _ in range(num_experts)]
@@ -401,14 +398,16 @@ def moe_forward(input_tensor: torch.Tensor,
     shared_w_up = weights['shared_experts.1.weight']
     shared_w_down = weights['shared_experts.2.weight']
 
-    shared_temp = F.silu(input_tensor @ shared_w_gate) * (input_tensor @ shared_w_up)     # (d_hidden, d_expert * n_shared_experts)
+    shared_temp = F.silu(input_tensor @ shared_w_gate) * (input_tensor @ shared_w_up)     # (batch_Size * seq_len, d_expert * n_shared_experts)
     shared_out = shared_temp @ shared_w_down        # (batch_Size * seq_len, d_hidden)
 
     logits = F.linear(input_tensor, weights["router.weight"])       # (batch_size * seq_len, n_routed_experts)
+    print(f"logits dtype : {logits.dtype}")
     scores = logits.softmax(dim=-1)     # (batch_size * seq_len, n_routed_experts)
     topk_scores, topk_indices = torch.topk(scores, k=n_experts_per_token, dim=-1, sorted=False)
     # topk_scores: token_id -> topk scores (batch_size * seq_len, n_experts_per_token)
     # topk_indices: token_id -> topk expert_id (batch_size * seq_len, n_experts_per_token)
+    print(f"topk_scores dtype : {topk_scores.dtype}")
 
     flat_expert_indices = topk_indices.view(-1)
     flat_expert_scores = topk_scores.view(-1, 1)
@@ -444,40 +443,27 @@ def moe_forward(input_tensor: torch.Tensor,
 
 
 def custom_kernel(data: input_t) -> output_t: # type: ignore
-    """
-    Submission template for DeepSeek-style Mixture of Experts using PyTorch.
-    
-    Args:
-        data: Tuple of (input: torch.Tensor, weights: Dict[str, torch.Tensor], config: Dict)
-            - input: Input tensor of shape [batch_size, seq_len, hidden_size]
-            - weights: Dictionary containing model weights
-            - config: Dictionary containing model configuration parameters
-            
-    Returns:
-        Tuple containing:
-            - output: Processed tensor [batch_size, seq_len, d_model]
-            - aux_data: Dictionary with auxiliary data
-    """
+
     input_tensor, weights, config = data
     output = moe_forward(input_tensor, weights, **config)
 
-    return output
+    return output  # type: ignore
 
 
 def profile_moe():
     # Configuration values
-    d_hidden = 512
-    dexpert = 1024
-    nroutedexperts = 4
+    dhidden = 7168
+    dexpert = 2048
+    nroutedexperts = 8
     nsharedexperts = 1
-    nexpertspertoken = 2
-    bs = 1
-    seqlen = 4
-    seed = 42
+    nexpertspertoken = 4
+    bs = 2
+    seqlen = 8192
+    seed = 81934
 
     # Generate input, weights, config
     input_tensor, weights, config = generate_input(
-        d_hidden,
+        dhidden,
         dexpert,
         nroutedexperts,
         nsharedexperts,
@@ -550,8 +536,8 @@ if __name__ == "__main__":
     my_moe_out = custom_kernel((input_tensor, weights, config))
     ref_moe_out = ref_custom_kernel((input_tensor, weights, config))
     diff = torch.abs(my_moe_out - ref_moe_out)
-    print("Reference MoE output shape:", ref_moe_out.shape)
-    print("My MoE output shape:", my_moe_out.shape)
+    print("Reference MoE output shape,dtype:", ref_moe_out.shape, ref_moe_out.dtype)
+    print("My MoE output shape, dtype", my_moe_out.shape, my_moe_out.dtype)
     run_test(my_moe_out, ref_moe_out, "triton")
     print(f"Final difference: {diff}")
 
