@@ -1,3 +1,6 @@
+import os
+os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -247,16 +250,19 @@ def configs():
     return [
         triton.Config({
             "BLOCKSIZE_M": BM, "BLOCKSIZE_N": BN,
-            "BLOCKSIZE_K": BK, "GROUPSIZE_M": 8,
-        }, )
+            "BLOCKSIZE_K": BK, "GROUPSIZE_M": GS,
+        }, num_warps=4, num_stages=3)
         for BM in [1]
         for BN in [64]
-        for BK in [128]
+        for BK in [64, 128]
+        for GS in [4, 8]
+
     ]
 
 @triton.autotune(
     configs= configs(),
-    key= ["M", "N", "K"],
+    key= ["num_expert_token_pairs", "d_hidden", "d_expert"],
+    reset_to_zero=["out"],
 )
 @triton.jit
 def expert_kernel(
@@ -510,14 +516,16 @@ def profile_moe():
     print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=30))
     prof.export_chrome_trace("moe_profile.json")
 
-def run_test(expect, actual, label, enabled=True):
-    print(f"  {label}: ...", end="")
+def run_test(expect, actual, enabled=True):
     if enabled:
-        passed = torch.allclose(expect, actual.to(expect.dtype), atol=1.0)
-        icon = "✅" if passed else "❌"
+        passed = torch.allclose(expect, actual, atol=1e-2, rtol=0)
+        if passed:
+            print("✅ Triton and Torch match")
+        else:
+            print("❌ Triton and Torch differ")
     else:
         icon = "⭕"
-    print(f"\r  {label}: {icon}  ")
+        print(f"\r  Disabled: {icon}  ")
 
 if __name__ == "__main__":
     torch.cuda.set_device(0)
@@ -551,7 +559,7 @@ if __name__ == "__main__":
     diff = torch.abs(my_moe_out - ref_moe_out)
     print("Reference MoE output shape,dtype:", ref_moe_out.shape, ref_moe_out.dtype)
     print("My MoE output shape, dtype", my_moe_out.shape, my_moe_out.dtype)
-    run_test(my_moe_out, ref_moe_out, "triton")
+    run_test(my_moe_out, ref_moe_out)
     print(f"Final difference: {diff}")
 
     

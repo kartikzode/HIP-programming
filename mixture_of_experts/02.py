@@ -1,3 +1,6 @@
+import os
+os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -247,57 +250,66 @@ def configs():
     return [
         triton.Config({
             "BLOCKSIZE_M": BM, "BLOCKSIZE_N": BN,
-            "BLOCKSIZE_K": BK, "GROUPSIZE_M": 8,
-        }, num_warps= w)
-        for BM in [16]
-        for BN in [16]
+            "BLOCKSIZE_K": BK, "GROUPSIZE_M": GS,
+        }, num_warps=4, num_stages=3)
+        for BM in [32]
+        for BN in [64]
         for BK in [64]
-        for w in [4]
+        for GS in [4]
+
     ]
 
 @triton.autotune(
     configs= configs(),
-    key= ["M", "N", "K"],
+    key= ["num_expert_token_pairs", "d_hidden", "d_expert"],
+    reset_to_zero=["out"],
 )
 @triton.jit
 def expert_kernel(
-    exp_gate,
-    exp_up,
-    exp_down,
+    W_gate,
+    W_up,
+    W_down,
     x,
     out,
+    max_tokens_per_expert,
     d_hidden,
     d_expert,
-    idxs_len,
-    exp_token_idxs,
-    exp_weights,
+    sorted_expert_scores_ptr,
+    token_idxs_ptr,
+    expert_counts_ptr,
+    expert_offsets_ptr,
     BLOCKSIZE_M: tl.constexpr,
     BLOCKSIZE_N: tl.constexpr,
     BLOCKSIZE_K: tl.constexpr,
     GROUPSIZE_M: tl.constexpr,
 ):
 
-    # expert_gate layout: (d_hidden, d_expert) : (d_expert, 1)
-    # expert_up layout: (d_hidden, d_expert) : (d_expert, 1)
-    # expert_down layout: (d_expert, d_hidden) : (d_hidden, 1)
-    # x (input_tensor) layout: (batch_size * seq_len, d_hidden) : (d_hidden, 1)
-    # out (output_tensor) layout: (batch_size * seq_len, d_hidden) : (d_hidden, 1)
+    # W_gate : (n_routed_experts, d_hidden, d_expert) : (d_hidden * d_expert, d_expert, 1)
+    # W_up : (n_routed_experts, d_hidden, d_expert) : (d_hidden * d_expert, d_expert, 1)
+    # W_down : (n_routed_experts, d_expert, d_hidden) : (d_expert * d_hidden, d_hidden, 1)
+    # x (batched_input) layout: (num_experts, max_tokens_per_Expert, d_hidden) : (max_tokens_per_expert * d_hidden, d_hidden, 1)
+    # out (output_tensor) layout: (num_experts, max_tokens_per_Expert, d_hidden) : (max_tokens_per_expert * d_hidden, d_hidden, 1)
+    # max_tokens_per_expert : M
     # d_hidden : N
-    # d_expert : intermediate 
-    # idxs_len : M
-    # exp_token_idxs : indexes of tokens assigned to a particular expert
-    # exp_weights: scores of that expert for teh above tokens
-    # grid : (cdiv(idxs_len, BM), cdiv(d_expert, BN))
+    # d_expert : intermediate
+    # sorted_exp_scores : (batch_size * seq_len * n_experts_per_token, ) : (1, 1)
+    # token_idxs : (batch_size * seq_len * n_experts_per_token, )
+    # expert_counts : (num_experts, ) : (1, )
+    # grid : (n_experts, cdiv(max_tokens_per_expert, BM) * cdiv(d_expert, BN))
 
-    pid = tl.program_id(axis=0)
-    num_pid_m = tl.cdiv(idxs_len, BLOCKSIZE_M)
+    expert_id = tl.program_id(axis=0)
+    expert_count = tl.load(expert_counts_ptr + expert_id)
+    expert_start_offset = tl.load(expert_offsets_ptr + expert_id)
+
+    pid_expert_flat = tl.program_id(axis=1)
+    num_pid_m = tl.cdiv(max_tokens_per_expert, BLOCKSIZE_M)
     num_pid_n = tl.cdiv(d_expert, BLOCKSIZE_N)
     num_pid_in_group = GROUPSIZE_M * num_pid_n
-    group_id = pid // num_pid_in_group
+    group_id = pid_expert_flat // num_pid_in_group
     first_pid_m = group_id * GROUPSIZE_M
     group_size_m = min(GROUPSIZE_M, num_pid_m - first_pid_m)
-    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
-    pid_n = (pid % num_pid_in_group) // group_size_m
+    pid_m = first_pid_m + (pid_expert_flat % group_size_m)
+    pid_n = (pid_expert_flat % num_pid_in_group) // group_size_m
 
     start_m = pid_m * BLOCKSIZE_M
     start_n = pid_n * BLOCKSIZE_N
@@ -306,33 +318,34 @@ def expert_kernel(
     offs_b0n = start_n + tl.arange(0, BLOCKSIZE_N)           # W_gate
     offs_b1n = start_n + tl.arange(0, BLOCKSIZE_N)           # W_up
     offs_b2n = start_n + tl.arange(0, BLOCKSIZE_N)           # W_down
-    offs_am = tl.where(offs_am < idxs_len, offs_am, 0)
+    m_mask = offs_am < max_tokens_per_expert
+    offs_am = tl.where(m_mask, offs_am, 0)
     offs_b0n = tl.where(offs_b0n < d_expert, offs_b0n, 0)
     offs_b1n = tl.where(offs_b1n < d_expert, offs_b1n, 0)
     offs_b2n = tl.where(offs_b2n < d_expert, offs_b2n, 0)
+    offs_cm = start_m + tl.arange(0, BLOCKSIZE_M)
+    c_mask = offs_cm < expert_count
+    offs_cm = tl.where(c_mask, offs_cm, 0)
     offs_k = tl.arange(0, BLOCKSIZE_K)
+    token_ids = tl.load(token_idxs_ptr + expert_start_offset + offs_cm)
+    
 
-    # laod the token ids and the expert scores to be fetched from X
-    offs_m_mask = tl.arange(0, BLOCKSIZE_M) < idxs_len - start_m
-    token_ids = tl.load(
-        exp_token_idxs + offs_am
-        )
-
-    scales = tl.load(
-        exp_weights + offs_am,
-        )
+    
+    x_expert_offset = expert_id * max_tokens_per_expert * d_hidden
+    weight_expert_offset = expert_id * d_hidden * d_expert
     
     # Pointer Arithmetic
-    a_ptrs = x + (token_ids[:, None] * d_hidden + offs_k[None, :])               # [BM, BK]
-    b0_ptrs = exp_gate + offs_k[:, None] * d_expert + offs_b0n[None, :]          # [BK, BN]
-    b1_ptrs = exp_up + offs_k[:, None] * d_expert + offs_b1n[None, :]            # [BK, BN]
-    b2_ptrs = exp_down + offs_b2n[:, None] * d_hidden + offs_k[None, :]          # [BN, BK]
+    expert_scores = tl.load(sorted_expert_scores_ptr + expert_start_offset + offs_cm)
+    a_ptrs = x + x_expert_offset + offs_am[:, None] * d_hidden + offs_k[None, :]               # [BM, BK]
+    b0_ptrs = W_gate + weight_expert_offset + offs_k[:, None] * d_expert + offs_b0n[None, :]          # [BK, BN]
+    b1_ptrs = W_up + weight_expert_offset + offs_k[:, None] * d_expert + offs_b1n[None, :]            # [BK, BN]
+    b2_ptrs = W_down + weight_expert_offset + offs_b2n[:, None] * d_hidden + offs_k[None, :]          # [BN, BK]
     
     gate_acc = tl.zeros((BLOCKSIZE_M, BLOCKSIZE_N), dtype=tl.float32)
     up_acc = tl.zeros((BLOCKSIZE_M, BLOCKSIZE_N), dtype=tl.float32)
 
     for k in range(0, tl.cdiv(d_hidden, BLOCKSIZE_K)):
-        a = tl.load(a_ptrs, mask=offs_k[None, :] < d_hidden - k * BLOCKSIZE_K, other=0.0)
+        a = tl.load(a_ptrs, mask= m_mask[:, None] & (offs_k[None, :] < d_hidden - k * BLOCKSIZE_K), other=0.0)
         b0 = tl.load(b0_ptrs, mask=offs_k[:, None] < d_hidden - k * BLOCKSIZE_K, other=0.0)
         
         gate_acc = tl.dot(a, b0, gate_acc, input_precision="ieee")         # [BM, BN]
@@ -353,15 +366,20 @@ def expert_kernel(
                      mask= offs_k[None, :] < d_hidden - k * BLOCKSIZE_K, other=0.0
                     )
         v = tl.dot(temp,b2, input_precision="ieee")   # [BM, BK]
-        v = v * scales[:, None]         # [BM, BK] * [BM, BK]
+        v = v * expert_scores[:, None]               # [BM, BK] * [BM, ]
 
         # writing to the out matrix
         tl.atomic_add(
             out + token_ids[:, None] * d_hidden + (k*BLOCKSIZE_K + offs_k[None, :]),
             v,
-            mask=offs_m_mask[:, None] & (offs_k[None, :] < d_hidden - k * BLOCKSIZE_K),
+            mask= c_mask[:, None] & (offs_k[None, :] < d_hidden - k * BLOCKSIZE_K),
         )
         b2_ptrs += BLOCKSIZE_K
+
+
+def _stack_tensor(weights, key_tmpl: str, n):
+    mats = [weights[key_tmpl.format(i)] for i in range(n)]
+    return torch.stack(mats, dim=0).contiguous()
 
 # config: {'d_hidden': 7168, 'd_expert': 2048, 'n_routed_experts': 32, 'n_shared_experts': 1, 'n_experts_per_token': 4, 'batch_size': 1, 'seq_len': 2048}
 # input_tensor layout: (batch_size, seq_len, d_hidden) : (d_hidden * seq_len, d_hidden, 1)
@@ -384,62 +402,82 @@ def moe_forward(input_tensor: torch.Tensor,
                 ) -> torch.Tensor:
     
     input_tensor = input_tensor.reshape(-1, d_hidden)
+    num_tokens, _ = input_tensor.shape
+
     out = torch.zeros_like(input_tensor, device= input_tensor.device, dtype=torch.float16)
 
     num_experts = n_routed_experts
-    experts = [{} for _ in range(num_experts)]
-    for i in range(num_experts):
-        experts[i]["w_gate"] = weights[f"experts.{i}.0.weight"]     # (d_hidden, d_expert) : (d_expert, 1)
-        experts[i]["w_up"] = weights[f"experts.{i}.1.weight"]       # (d_hidden, d_expert) : (d_expert, 1) 
-        experts[i]["w_down"] = weights[f"experts.{i}.2.weight"]     # (d_expert, d_hidden) : (d_hidden, 1)
 
+    # Combined weight tensors for all routed experts
+    W_gate = _stack_tensor(weights, "experts.{}.0.weight", num_experts)
+    # W_gate : (n_routed_experts, d_hidden, d_expert) : (d_hidden * d_expert, d_expert, 1) 
+    W_up = _stack_tensor(weights, "experts.{}.1.weight", num_experts)
+    # W_up : (n_routed_experts, d_hidden, d_expert) : (d_hidden * d_expert, d_expert, 1)
+    W_down = _stack_tensor(weights, "experts.{}.2.weight", num_experts)
+    # W_down : (n_routed_experts, d_expert, d_hidden) : (d_expert * d_hidden, d_hidden, 1)
 
+    # Shared Expert/s
     shared_w_gate = weights['shared_experts.0.weight']
     shared_w_up = weights['shared_experts.1.weight']
     shared_w_down = weights['shared_experts.2.weight']
 
-    shared_temp = F.silu(input_tensor @ shared_w_gate) * (input_tensor @ shared_w_up)     # (batch_Size * seq_len, d_expert * n_shared_experts)
+    shared_temp = F.silu(input_tensor @ shared_w_gate) * (input_tensor @ shared_w_up)     # (batch_size * seq_len, d_expert * n_shared_experts)
     shared_out = shared_temp @ shared_w_down        # (batch_Size * seq_len, d_hidden)
 
     logits = F.linear(input_tensor, weights["router.weight"])       # (batch_size * seq_len, n_routed_experts)
-    print(f"logits dtype : {logits.dtype}")
+    # print(f"logits dtype : {logits.dtype}")
     scores = logits.softmax(dim=-1)     # (batch_size * seq_len, n_routed_experts)
     topk_scores, topk_indices = torch.topk(scores, k=n_experts_per_token, dim=-1, sorted=False)
-    # topk_scores: token_id -> topk scores (batch_size * seq_len, n_experts_per_token)
-    # topk_indices: token_id -> topk expert_id (batch_size * seq_len, n_experts_per_token)
-    print(f"topk_scores dtype : {topk_scores.dtype}")
+    # topk_scores: (batch_size * seq_len, n_experts_per_token)
+    # topk_indices: (batch_size * seq_len, n_experts_per_token)
+    # print(f"topk_scores dtype : {topk_scores.dtype}")
 
     flat_expert_indices = topk_indices.view(-1)
-    flat_expert_scores = topk_scores.view(-1, 1)
-    idxs = flat_expert_indices.argsort()
-    counts = flat_expert_indices.bincount().cpu().numpy()
-    tokens_per_expert = counts.cumsum()
-    token_idxs = idxs // n_experts_per_token
-
-    for expert_id, end_idx in enumerate(tokens_per_expert):
-        start_idx = 0 if expert_id == 0 else tokens_per_expert[expert_id - 1]
-        if start_idx == end_idx:
-            continue
-
-        expert = experts[expert_id]
-        exp_token_idxs = token_idxs[start_idx:end_idx]
-
-        grid = lambda META: (triton.cdiv(len(exp_token_idxs), META["BLOCKSIZE_M"]) * triton.cdiv(d_expert, META["BLOCKSIZE_N"]), )
-        expert_kernel[grid](
-            expert["w_gate"],
-            expert["w_up"],
-            expert["w_down"],
-            input_tensor,
-            out,
-            d_hidden,
-            d_expert,
-            len(exp_token_idxs),
-            exp_token_idxs,
-            flat_expert_scores[idxs[start_idx:end_idx]],
-        )
+    # flat_expert_indices -> (batch_size*seq_len*n_experts_per_token, ) : (1, )
+    flat_expert_scores = topk_scores.view(-1)
+    # flat_expert_scores -> (batch_size*seq_len*n_experts_per_token, 1) : (1, 1)
+    idxs = flat_expert_indices.argsort()    
+    # (batch_size * seq_len * n_experts_per_token, )
+    sorted_expert_ids = flat_expert_indices[idxs]
+    sorted_expert_scores = flat_expert_scores[idxs]
+    token_idxs = idxs // n_experts_per_token  
+    # (batch_size * seq_len * n_experts_per_token, )
     
-    torch.cuda.synchronize()
-    return (out + shared_out).reshape(batch_size, seq_len, d_hidden)
+    counts = sorted_expert_ids.to(torch.int32).bincount(minlength=num_experts)      # [num_experts]
+    expert_offsets = torch.zeros_like(counts)
+    expert_offsets[1:] = torch.cumsum(counts[:-1], dim=0)
+    max_tokens_per_expert = counts.max().item()
+
+    sorted_input = input_tensor[token_idxs]   
+    # (batch_size * seq_len * n_experts_per_token, d_hidden)
+
+    batched_input = torch.zeros(size=(num_experts, max_tokens_per_expert, d_hidden),  # type: ignore
+                                device=input_tensor.device,
+                                dtype= input_tensor.dtype)
+
+    sorted_input_token_indices = torch.arange(sorted_input.shape[0], device=input_tensor.device)
+    token_group_offset = expert_offsets[sorted_expert_ids]
+    token_offset_inside_token_group = sorted_input_token_indices - token_group_offset
+    batched_input[sorted_expert_ids, token_offset_inside_token_group, :] = sorted_input
+    
+    grid = lambda META: (num_experts, triton.cdiv(max_tokens_per_expert, META["BLOCKSIZE_M"]) * triton.cdiv(d_expert, META["BLOCKSIZE_N"]), )
+
+    expert_kernel[grid](
+        W_gate,
+        W_up,
+        W_down,
+        batched_input,
+        out,
+        max_tokens_per_expert,
+        d_hidden,
+        d_expert,
+        sorted_expert_scores,
+        token_idxs,
+        counts,
+        expert_offsets,
+    )
+    
+    return (shared_out + out).reshape(batch_size, seq_len, d_hidden)
 
 
 def custom_kernel(data: input_t) -> output_t: # type: ignore
@@ -447,7 +485,7 @@ def custom_kernel(data: input_t) -> output_t: # type: ignore
     input_tensor, weights, config = data
     output = moe_forward(input_tensor, weights, **config)
 
-    return output  # type: ignore
+    return output # type: ignore
 
 
 def profile_moe():
@@ -510,13 +548,13 @@ def run_test(expect, actual, enabled=True):
 
 if __name__ == "__main__":
     torch.cuda.set_device(0)
-    dhidden = 7168
-    dexpert = 2048
+    dhidden = 512
+    dexpert = 128
     nroutedexperts = 8
     nsharedexperts = 1
     nexpertspertoken = 4
     bs = 2
-    seqlen = 8192
+    seqlen = 16
     seed = 81934
 
     input_tensor, weights, config = generate_input(
@@ -540,7 +578,7 @@ if __name__ == "__main__":
     diff = torch.abs(my_moe_out - ref_moe_out)
     print("Reference MoE output shape,dtype:", ref_moe_out.shape, ref_moe_out.dtype)
     print("My MoE output shape, dtype", my_moe_out.shape, my_moe_out.dtype)
-    run_test(my_moe_out, ref_moe_out,)
+    run_test(my_moe_out, ref_moe_out)
     print(f"Final difference: {diff}")
 
     
