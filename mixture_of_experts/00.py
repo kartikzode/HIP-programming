@@ -7,7 +7,8 @@ from task import input_t, output_t
 from torch.profiler import profile, record_function, ProfilerActivity
 import triton.language as tl
 import triton
-
+import os
+os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
 
 class Expert(nn.Module):
     def __init__(self, config: Dict, d_expert: Optional[int] = None):
@@ -247,17 +248,17 @@ def configs():
     return [
         triton.Config({
             "BLOCKSIZE_M": BM, "BLOCKSIZE_N": BN,
-            "BLOCKSIZE_K": BK, "GROUPSIZE_M": 8,
-        }, num_warps= w)
-        for BM in [16]
-        for BN in [16]
-        for BK in [64]
-        for w in [4]
+            "BLOCKSIZE_K": BK, "GROUPSIZE_M": GS,
+        }, num_warps= 4, num_stages= 3)
+        for BM in [64]
+        for BN in [64]
+        for BK in [128]
+        for GS in [4]
     ]
 
 @triton.autotune(
     configs= configs(),
-    key= ["M", "N", "K"],
+    key= [],
 )
 @triton.jit
 def expert_kernel(
@@ -545,5 +546,6 @@ if __name__ == "__main__":
 
     
 
-    # profiel the custom kernel
+    # # profiel the custom kernel
     # profile_moe()
+    # best config selected: BLOCKSIZE_M: 64, BLOCKSIZE_N: 64, BLOCKSIZE_K: 128, GROUPSIZE_M: 4, num_warps: 4, num_ctas: 1, num_stages: 3, maxnreg: None;
