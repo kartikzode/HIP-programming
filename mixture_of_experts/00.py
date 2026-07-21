@@ -256,6 +256,10 @@ def configs():
         for GS in [4]
     ]
 
+@triton.jit
+def silu(x): return (x * tl.sigmoid(x.to(tl.float32))).to(tl.float16)
+
+
 @triton.autotune(
     configs= configs(),
     key= [],
@@ -344,16 +348,21 @@ def expert_kernel(
         b0_ptrs += BLOCKSIZE_K * d_expert
         b1_ptrs += BLOCKSIZE_K * d_expert
 
+    # --- Apply Activation and Element-wise Product (Mimic Reference FP16 Path) ---
+    # 1. Cast FP32 accumulated results down to FP16 (like output of nn.Linear)
+    gate_acc_fp16 = gate_acc.to(tl.float16)
+    up_acc_fp16 = up_acc.to(tl.float16)
+
     #SiLu
-    gate_acc = gate_acc * tl.sigmoid(gate_acc)
-    temp = gate_acc * up_acc        # [BM,BN]
-    temp = temp.to(tl.float16)
+    silu_gate_fp16 = silu(gate_acc_fp16)
+
+    temp = silu_gate_fp16 * up_acc_fp16       # [BM,BN]
     
     for k in range(0, tl.cdiv(d_hidden,BLOCKSIZE_K)):
         b2 = tl.load(b2_ptrs,
                      mask= offs_k[None, :] < d_hidden - k * BLOCKSIZE_K, other=0.0
                     )
-        v = tl.dot(temp,b2, input_precision="ieee")   # [BM, BK]
+        v = tl.dot(temp,b2, input_precision="ieee", out_dtype= tl.float32)   # [BM, BK] 
         v = v * scales[:, None]         # [BM, BK] * [BM, BK]
 
         # writing to the out matrix
@@ -527,13 +536,13 @@ def benchmark(fn, data, warmup: int = 10, iterations: int = 50):
 
 if __name__ == "__main__":
     torch.cuda.set_device(0)
-    dhidden = 128
-    dexpert = 128
-    nroutedexperts = 4
+    dhidden = 7168
+    dexpert = 2048
+    nroutedexperts = 8
     nsharedexperts = 1
-    nexpertspertoken = 2
+    nexpertspertoken = 4
     bs = 2
-    seqlen = 8
+    seqlen = 8192
     seed = 81934
 
     input_tensor, weights, config = generate_input(
@@ -547,26 +556,26 @@ if __name__ == "__main__":
         seed
     )
     print("Input tensor shape:", input_tensor.shape)
-    # print("Weights dictionary keys:", list(weights.keys()))
-    # for key, value in weights.items():
-    #     print(f"{key}: {value.shape}")
-    # print("Config dictionary:", config)
+    print("Weights dictionary keys:", list(weights.keys()))
+    for key, value in weights.items():
+        print(f"{key}: {value.shape}")
+    print("Config dictionary:", config)
 
-    # my_moe_out = custom_kernel((input_tensor, weights, config))
-    # ref_moe_out = ref_custom_kernel((input_tensor, weights, config))
-    # diff = torch.abs(my_moe_out - ref_moe_out)
-    # print("Reference MoE output shape,dtype:", ref_moe_out.shape, ref_moe_out.dtype)
-    # print("My MoE output shape, dtype", my_moe_out.shape, my_moe_out.dtype)
-    # run_test(my_moe_out, ref_moe_out,)
-    # print(f"Final difference: {diff}")
+    my_moe_out = custom_kernel((input_tensor, weights, config))
+    ref_moe_out = ref_custom_kernel((input_tensor, weights, config))
+    diff = torch.abs(my_moe_out - ref_moe_out)
+    print("Reference MoE output shape,dtype:", ref_moe_out.shape, ref_moe_out.dtype)
+    print("My MoE output shape, dtype", my_moe_out.shape, my_moe_out.dtype)
+    run_test(my_moe_out, ref_moe_out,)
+    print(f"Final difference: {diff}")
 
-    data = (input_tensor, weights, config)
-    latency_pytorch = benchmark(ref_custom_kernel, data, )
-    latency_triton = benchmark(custom_kernel, data, )
+    # data = (input_tensor, weights, config)
+    # latency_pytorch = benchmark(ref_custom_kernel, data, )
+    # latency_triton = benchmark(custom_kernel, data, )
 
-    print(f"Approach ref latency: {latency_pytorch:.4f} ms")
-    print(f"Approach custom latency: {latency_triton:.4f} ms")
-    print(f"Speedup: {latency_pytorch / latency_triton:.2f}x")
+    # print(f"Approach ref latency: {latency_pytorch:.4f} ms")
+    # print(f"Approach custom latency: {latency_triton:.4f} ms")
+    # print(f"Speedup: {latency_pytorch / latency_triton:.2f}x")
 
     
 

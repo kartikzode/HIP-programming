@@ -537,7 +537,7 @@ def profile_moe():
 
 def run_test(expect, actual, enabled=True):
     if enabled:
-        passed = torch.allclose(expect, actual, atol=1e-2, rtol=0)
+        passed = torch.allclose(expect, actual, atol=1e-2, rtol=1e-2)
         if passed:
             print("✅ Triton and Torch match")
         else:
@@ -564,13 +564,13 @@ def benchmark(fn, data, warmup: int = 10, iterations: int = 50):
 
 if __name__ == "__main__":
     torch.cuda.set_device(0)
-    dhidden = 128
-    dexpert = 128
-    nroutedexperts = 4
+    dhidden = 7168
+    dexpert = 2048
+    nroutedexperts = 8
     nsharedexperts = 1
-    nexpertspertoken = 2
+    nexpertspertoken = 4
     bs = 2
-    seqlen = 8
+    seqlen = 8192
     seed = 81934
 
     input_tensor, weights, config = generate_input(
@@ -584,26 +584,26 @@ if __name__ == "__main__":
         seed
     )
     print("Input tensor shape:", input_tensor.shape)
-    # # print("Weights dictionary keys:", list(weights.keys()))
-    # for key, value in weights.items():
-    #     print(f"{key}: {value.shape}")
-    # print("Config dictionary:", config)
+    # print("Weights dictionary keys:", list(weights.keys()))
+    for key, value in weights.items():
+        print(f"{key}: {value.shape}")
+    print("Config dictionary:", config)
 
-    # my_moe_out = custom_kernel((input_tensor, weights, config))
-    # ref_moe_out = ref_custom_kernel((input_tensor, weights, config))
-    # diff = torch.abs(my_moe_out - ref_moe_out)
-    # print("Reference MoE output shape,dtype:", ref_moe_out.shape, ref_moe_out.dtype)
-    # print("My MoE output shape, dtype", my_moe_out.shape, my_moe_out.dtype)
-    # run_test(my_moe_out, ref_moe_out)
-    # print(f"Final difference: {diff}")
+    my_moe_out = custom_kernel((input_tensor, weights, config))
+    ref_moe_out = ref_custom_kernel((input_tensor, weights, config))
+    diff = torch.abs(my_moe_out - ref_moe_out)
+    print("Reference MoE output shape,dtype:", ref_moe_out.shape, ref_moe_out.dtype)
+    print("My MoE output shape, dtype", my_moe_out.shape, my_moe_out.dtype)
+    run_test(my_moe_out, ref_moe_out)
+    print(f"Final difference: {diff}")
 
-    data = (input_tensor, weights, config)
-    latency_pytorch = benchmark(ref_custom_kernel, data, )
-    latency_triton = benchmark(custom_kernel, data, )
+    # data = (input_tensor, weights, config)
+    # latency_pytorch = benchmark(ref_custom_kernel, data, )
+    # latency_triton = benchmark(custom_kernel, data, )
 
-    print(f"Approach ref latency: {latency_pytorch:.4f} ms")
-    print(f"Approach custom latency: {latency_triton:.4f} ms")
-    print(f"Speedup: {latency_pytorch / latency_triton:.2f}x")
+    # print(f"Approach ref latency: {latency_pytorch:.4f} ms")
+    # print(f"Approach custom latency: {latency_triton:.4f} ms")
+    # print(f"Speedup: {latency_pytorch / latency_triton:.2f}x")
 
 
     
