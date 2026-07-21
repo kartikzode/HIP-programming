@@ -261,7 +261,7 @@ def configs():
 
 @triton.autotune(
     configs= configs(),
-    key= ["num_expert_token_pairs", "d_hidden", "d_expert"],
+    key= [],
     reset_to_zero=["out"],
 )
 @triton.jit

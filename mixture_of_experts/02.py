@@ -261,8 +261,7 @@ def configs():
 
 @triton.autotune(
     configs= configs(),
-    key= ["num_expert_token_pairs", "d_hidden", "d_expert"],
-    reset_to_zero=["out"],
+    key= [],
 )
 @triton.jit
 def expert_kernel(
@@ -548,13 +547,13 @@ def run_test(expect, actual, enabled=True):
 
 if __name__ == "__main__":
     torch.cuda.set_device(0)
-    dhidden = 512
-    dexpert = 128
+    dhidden = 7168
+    dexpert = 2048
     nroutedexperts = 8
     nsharedexperts = 1
     nexpertspertoken = 4
     bs = 2
-    seqlen = 16
+    seqlen = 8192
     seed = 81934
 
     input_tensor, weights, config = generate_input(
