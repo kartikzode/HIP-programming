@@ -1,3 +1,5 @@
+from utils import make_match_reference
+from task import input_t, output_t
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -240,63 +242,43 @@ def generate_input(
     return (input_tensor, weights, config)
 
 
-def profile_moe():
-    # Configuration values
-    dhidden = 512
-    dexpert = 1024
-    nroutedexperts = 4
-    nsharedexperts = 1
-    nexpertspertoken = 2
-    bs = 1
-    seqlen = 4
-    seed = 42
+# def profile_moe():
+#     # Configuration values
+#     dhidden = 512
+#     dexpert = 1024
+#     nroutedexperts = 4
+#     nsharedexperts = 1
+#     nexpertspertoken = 2
+#     bs = 1
+#     seqlen = 4
+#     seed = 42
 
-    # Generate input, weights, config
-    input_tensor, weights, config = generate_input(
-        dhidden,
-        dexpert,
-        nroutedexperts,
-        nsharedexperts,
-        nexpertspertoken,
-        bs,
-        seqlen,
-        seed
-    )
+#     # Generate input, weights, config
+#     input_tensor, weights, config = generate_input(
+#         dhidden,
+#         dexpert,
+#         nroutedexperts,
+#         nsharedexperts,
+#         nexpertspertoken,
+#         bs,
+#         seqlen,
+#         seed
+#     )
 
-    with profile(
-        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-        record_shapes=True,
-        profile_memory=True,
-        with_stack=True
-    ) as prof:
-        with record_function("moe_forward"):
-            for _ in range(10):  # warmup + measurement
-                output = ref_kernel((input_tensor, weights, config))
-                torch.cuda.synchronize()
+#     with profile(
+#         activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+#         record_shapes=True,
+#         profile_memory=True,
+#         with_stack=True
+#     ) as prof:
+#         with record_function("moe_forward"):
+#             for _ in range(10):  # warmup + measurement
+#                 output = ref_kernel((input_tensor, weights, config))
+#                 torch.cuda.synchronize()
 
-    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=30))
-    prof.export_chrome_trace("moe_profile.json")
-
-    
-    # # Run the reference kernel
-    # output = ref_kernel((input_tensor, weights, config))
-
-    # # Print only shapes
-    # print("Input shape:", input_tensor.shape)
-    # print("Router weight shape:", weights['router.weight'].shape)
-
-    # for i in range(nroutedexperts):
-    #     print(f"Expert {i} gate weight shape:", weights[f'experts.{i}.0.weight'].shape)
-    #     print(f"Expert {i} up weight shape:",   weights[f'experts.{i}.1.weight'].shape)
-    #     print(f"Expert {i} down weight shape:", weights[f'experts.{i}.2.weight'].shape)
-
-    # print("Shared expert gate weight shape:", weights['shared_experts.0.weight'].shape)
-    # print("Shared expert up weight shape:",   weights['shared_experts.1.weight'].shape)
-    # print("Shared expert down weight shape:", weights['shared_experts.2.weight'].shape)
-
-    # print("Output shape:", output.shape)
+#     print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=30))
+#     prof.export_chrome_trace("moe_profile.json")
     
 
-if __name__ == "__main__":
-    profile_moe()
+check_implementation = make_match_reference(ref_kernel, rtol=1e-2, atol=1e-2)
 

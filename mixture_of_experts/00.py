@@ -252,7 +252,7 @@ def configs():
         }, num_warps= 4, num_stages= 3)
         for BM in [64]
         for BN in [64]
-        for BK in [128]
+        for BK in [64]
         for GS in [4]
     ]
 
@@ -403,12 +403,12 @@ def moe_forward(input_tensor: torch.Tensor,
     shared_out = shared_temp @ shared_w_down        # (batch_Size * seq_len, d_hidden)
 
     logits = F.linear(input_tensor, weights["router.weight"])       # (batch_size * seq_len, n_routed_experts)
-    print(f"logits dtype : {logits.dtype}")
+    # print(f"logits dtype : {logits.dtype}")
     scores = logits.softmax(dim=-1)     # (batch_size * seq_len, n_routed_experts)
     topk_scores, topk_indices = torch.topk(scores, k=n_experts_per_token, dim=-1, sorted=False)
     # topk_scores: token_id -> topk scores (batch_size * seq_len, n_experts_per_token)
     # topk_indices: token_id -> topk expert_id (batch_size * seq_len, n_experts_per_token)
-    print(f"topk_scores dtype : {topk_scores.dtype}")
+    # print(f"topk_scores dtype : {topk_scores.dtype}")
 
     flat_expert_indices = topk_indices.view(-1)
     flat_expert_scores = topk_scores.view(-1, 1)
@@ -509,15 +509,31 @@ def run_test(expect, actual, enabled=True):
         icon = "⭕"
         print(f"\r  Disabled: {icon}  ")
 
+def benchmark(fn, data, warmup: int = 10, iterations: int = 50):
+    for _ in range(warmup):
+        fn(data)
+
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+
+    start.record()
+    for _ in range(iterations):
+        fn(data)
+    end.record()
+
+    torch.cuda.synchronize()
+    return start.elapsed_time(end) / iterations
+
 if __name__ == "__main__":
     torch.cuda.set_device(0)
-    dhidden = 7168
-    dexpert = 2048
-    nroutedexperts = 8
+    dhidden = 128
+    dexpert = 128
+    nroutedexperts = 4
     nsharedexperts = 1
-    nexpertspertoken = 4
+    nexpertspertoken = 2
     bs = 2
-    seqlen = 8192
+    seqlen = 8
     seed = 81934
 
     input_tensor, weights, config = generate_input(
@@ -532,17 +548,25 @@ if __name__ == "__main__":
     )
     print("Input tensor shape:", input_tensor.shape)
     # print("Weights dictionary keys:", list(weights.keys()))
-    for key, value in weights.items():
-        print(f"{key}: {value.shape}")
-    print("Config dictionary:", config)
+    # for key, value in weights.items():
+    #     print(f"{key}: {value.shape}")
+    # print("Config dictionary:", config)
 
-    my_moe_out = custom_kernel((input_tensor, weights, config))
-    ref_moe_out = ref_custom_kernel((input_tensor, weights, config))
-    diff = torch.abs(my_moe_out - ref_moe_out)
-    print("Reference MoE output shape,dtype:", ref_moe_out.shape, ref_moe_out.dtype)
-    print("My MoE output shape, dtype", my_moe_out.shape, my_moe_out.dtype)
-    run_test(my_moe_out, ref_moe_out,)
-    print(f"Final difference: {diff}")
+    # my_moe_out = custom_kernel((input_tensor, weights, config))
+    # ref_moe_out = ref_custom_kernel((input_tensor, weights, config))
+    # diff = torch.abs(my_moe_out - ref_moe_out)
+    # print("Reference MoE output shape,dtype:", ref_moe_out.shape, ref_moe_out.dtype)
+    # print("My MoE output shape, dtype", my_moe_out.shape, my_moe_out.dtype)
+    # run_test(my_moe_out, ref_moe_out,)
+    # print(f"Final difference: {diff}")
+
+    data = (input_tensor, weights, config)
+    latency_pytorch = benchmark(ref_custom_kernel, data, )
+    latency_triton = benchmark(custom_kernel, data, )
+
+    print(f"Approach ref latency: {latency_pytorch:.4f} ms")
+    print(f"Approach custom latency: {latency_triton:.4f} ms")
+    print(f"Speedup: {latency_pytorch / latency_triton:.2f}x")
 
     
 
