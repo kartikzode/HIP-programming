@@ -1,0 +1,676 @@
+import os
+os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Dict, Tuple, List, Optional
+import math
+from task import input_t, output_t
+from torch.profiler import profile, record_function, ProfilerActivity
+import triton.language as tl
+import triton
+
+
+class Expert(nn.Module):
+    def __init__(self, config: Dict, d_expert: Optional[int] = None):
+        super().__init__()
+        self.config = config
+        self.act_fn = nn.SiLU()
+        self.d_hidden: int = config["d_hidden"]
+        self.d_expert: int = config["d_expert"] if d_expert is None else d_expert
+
+        self.W_gate = nn.Linear(self.d_hidden, self.d_expert, bias=False)
+        self.W_up = nn.Linear(self.d_hidden, self.d_expert, bias=False)
+        self.W_down = nn.Linear(self.d_expert, self.d_hidden, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gate = self.act_fn(self.W_gate(x))
+        out = self.W_down(gate * self.W_up(x))
+        return out
+
+
+class MoEGate(nn.Module):
+    def __init__(self, config: Dict):
+        super().__init__()
+        self.top_k: int = config["n_experts_per_token"]
+        self.num_experts: int = config["n_routed_experts"]
+        self.d_hidden: int = config["d_hidden"]
+
+        self.W_g = nn.Linear(self.d_hidden, self.num_experts, bias=False)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # logits will be of shape [batch, seq, num_experts]
+        # and we apply softmax on the last dimension i.e. the number of experts
+        logits = self.W_g(x)
+        scores = logits.softmax(dim=-1)
+        # torch.topk returns a namedtuple of (values, indices)
+        topk_scores, topk_indices = torch.topk(scores, k=self.top_k, dim=-1, sorted=False)
+
+        return topk_indices, topk_scores
+
+
+class MoE(nn.Module):
+    def __init__(self, config: Dict):
+        super().__init__()
+        self.config = config
+        self.experts = nn.ModuleList([
+            Expert(config)
+            for _ in range(config["n_routed_experts"])
+        ])
+        self.gating_network = MoEGate(config)
+        shared_expert_dim = config["d_expert"] * config["n_shared_experts"]
+        self.shared_expert = Expert(config=config, d_expert=shared_expert_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        shared_output = self.shared_expert(x)
+        expert_indices, expert_scores = self.gating_network(x)
+        batch_size, seq_len, hidden_dim = x.shape
+        orig_shape = x.shape
+        x_flat = x.view(-1, hidden_dim)
+        flat_expert_indices = expert_indices.view(-1)
+        flat_expert_weights = expert_scores.view(-1, 1)
+        routed_output_flat = self.moe_infer(x_flat,
+                                            flat_expert_indices,
+                                            flat_expert_weights)
+
+        routed_output = routed_output_flat.view(*orig_shape)
+        return routed_output + shared_output
+
+    @torch.no_grad()
+    def moe_infer(self,
+                  x: torch.Tensor,
+                  flat_expert_indices: torch.Tensor,
+                  flat_expert_weights: torch.Tensor
+                 ) -> torch.Tensor:
+        expert_cache = torch.zeros_like(x)
+        idxs = flat_expert_indices.argsort()
+        counts = flat_expert_indices.bincount().cpu().numpy()
+        tokens_per_expert = counts.cumsum()
+        num_per_tok = self.config["n_experts_per_token"]
+        token_idxs = idxs // num_per_tok
+        for expert_id, end_idx in enumerate(tokens_per_expert):
+            start_idx = 0 if expert_id == 0 else tokens_per_expert[expert_id - 1]
+            if start_idx == end_idx:
+                continue
+
+            expert = self.experts[expert_id]
+            exp_token_idxs = token_idxs[start_idx:end_idx]
+            expert_tokens = x[exp_token_idxs]
+            expert_out    = expert(expert_tokens)
+            expert_out.mul_(flat_expert_weights[idxs[start_idx:end_idx]])
+            expert_cache.scatter_reduce_(
+                0,
+                exp_token_idxs.view(-1, 1).repeat(1, x.shape[-1]),
+                expert_out,
+                reduce='sum'
+            )
+
+        return expert_cache
+
+
+def ref_custom_kernel(data: input_t) -> output_t:  # type: ignore
+    """
+    Reference implementation of DeepSeek-style Mixture of Experts using PyTorch.
+    
+    Args:
+        data: Tuple of (input: torch.Tensor, weights: Dict[str, torch.Tensor], config: Dict)
+            - input: Input tensor of shape [batch_size, seq_len, hidden_dim]
+            - weights: Dictionary containing model weights
+            - config: Dictionary containing model configuration parameters
+            
+    Returns:
+        Tuple containing:
+            - output: Processed tensor [batch_size, seq_len, d_model]
+            - aux_data: Dictionary with auxiliary data
+    """
+    input_tensor, weights, config = data
+    num_experts = config["n_routed_experts"]
+    moe = MoE(config)
+
+    # Fill in the given weights of the model
+    moe.gating_network.W_g.weight = nn.Parameter(weights['router.weight'])
+
+    for i in range(num_experts):
+        gate_proj_weight = weights[f'experts.{i}.0.weight']
+        up_proj_weight = weights[f'experts.{i}.1.weight']
+        down_proj_weight = weights[f'experts.{i}.2.weight']
+
+        # Transpose weights to match expected shape for nn.Linear
+        moe.experts[i].W_gate.weight = nn.Parameter(gate_proj_weight.t()) # type: ignore
+        moe.experts[i].W_up.weight = nn.Parameter(up_proj_weight.t()) # pyright: ignore[reportAttributeAccessIssue]
+        moe.experts[i].W_down.weight = nn.Parameter(down_proj_weight.t()) # type: ignore
+
+    moe.shared_expert.W_gate.weight = nn.Parameter(weights['shared_experts.0.weight'].t())
+    moe.shared_expert.W_up.weight = nn.Parameter(weights['shared_experts.1.weight'].t())
+    moe.shared_expert.W_down.weight = nn.Parameter(weights['shared_experts.2.weight'].t())
+
+    output = moe(input_tensor)
+
+    return output
+
+
+def generate_input(
+    d_hidden: int,
+    dexpert: int,
+    nroutedexperts: int,
+    nsharedexperts: int,
+    nexpertspertoken: int,
+    bs: int,
+    seqlen: int,
+    seed: int
+):
+
+    # Really dumb but for now _ isn't parsing correctly.
+    d_hidden = d_hidden
+    d_expert = dexpert
+    n_routed_experts = nroutedexperts
+    n_shared_experts = nsharedexperts
+    n_experts_per_token = nexpertspertoken
+    batch_size = bs
+    seq_len = seqlen
+
+    config = {
+        "d_hidden": d_hidden,
+        "d_expert": d_expert,
+        "n_routed_experts": n_routed_experts,
+        "n_shared_experts": n_shared_experts,
+        "n_experts_per_token": n_experts_per_token,
+        "batch_size": batch_size,
+        "seq_len": seq_len,
+    }
+
+    gen = torch.Generator(device='cuda')
+    gen.manual_seed(seed)
+
+    num_experts = n_routed_experts
+    expert_dim = d_expert
+    weights = {}
+
+    input_tensor = torch.randn(
+        (batch_size, seq_len, d_hidden),
+        device='cuda',
+        dtype=torch.float16,
+        generator=gen
+    ).contiguous()
+
+    # Initialize router weights
+    weights['router.weight'] = torch.randn(
+        (num_experts, d_hidden),
+        device="cuda",
+        dtype=torch.float16,
+        generator=gen
+    ) / math.sqrt(d_hidden)
+
+    for i in range(num_experts):
+        weights[f'experts.{i}.0.weight'] = torch.randn(
+            (d_hidden, expert_dim),
+            device='cuda',
+            dtype=torch.float16,
+            generator=gen
+        ) / math.sqrt(expert_dim)
+
+        weights[f'experts.{i}.1.weight'] = torch.randn(
+            (d_hidden, expert_dim),
+            device='cuda',
+            dtype=torch.float16,
+            generator=gen
+        ) / math.sqrt(expert_dim)
+
+        weights[f'experts.{i}.2.weight'] = torch.randn(
+            (expert_dim, d_hidden),
+            device='cuda',
+            dtype=torch.float16,
+            generator=gen
+        ) / math.sqrt(d_hidden)
+    
+    weights['shared_experts.0.weight'] = torch.randn(
+        (d_hidden, expert_dim * n_shared_experts),
+        device='cuda',
+        dtype=torch.float16,
+        generator=gen
+    ) / math.sqrt(expert_dim * n_shared_experts)
+    weights['shared_experts.1.weight'] = torch.randn(
+        (d_hidden, expert_dim * n_shared_experts),
+        device='cuda',
+        dtype=torch.float16,
+        generator=gen
+    ) / math.sqrt(expert_dim * n_shared_experts)
+    weights['shared_experts.2.weight'] = torch.randn(
+        (expert_dim * n_shared_experts, d_hidden),
+        device='cuda',
+        dtype=torch.float16,
+        generator=gen
+    ) / math.sqrt(d_hidden)
+
+    return (input_tensor, weights, config)
+
+
+def configs():
+    return [
+        triton.Config({
+            "BLOCKSIZE_M": BM, "BLOCKSIZE_N": BN,
+            "BLOCKSIZE_K": BK, "GROUPSIZE_M": GS,
+        }, num_warps=4, num_stages=3)
+        for BM in [32]
+        for BN in [64]
+        for BK in [64]
+        for GS in [4]
+
+    ]
+
+
+@triton.jit
+def silu(x): return (x * tl.sigmoid(x.to(tl.float32))).to(tl.float16)
+
+
+@triton.autotune(
+    configs= configs(),
+    key= [],
+)
+@triton.jit
+def gate_up_silu_kernel(
+    W_gate,
+    W_up,
+    x,
+    routed_temp,
+    max_tokens_per_expert,
+    d_hidden,
+    d_expert,
+    BLOCKSIZE_M: tl.constexpr,
+    BLOCKSIZE_N: tl.constexpr,
+    BLOCKSIZE_K: tl.constexpr,
+    GROUPSIZE_M: tl.constexpr,
+):
+    # W_gate : (n_routed_experts, d_hidden, d_expert) : (d_hidden * d_expert, d_expert, 1)
+    # W_up : (n_routed_experts, d_hidden, d_expert) : (d_hidden * d_expert, d_expert, 1)
+    # x (batched_input) layout: (num_experts, max_tokens_per_Expert, d_hidden) : (max_tokens_per_expert * d_hidden, d_hidden, 1)
+    # routed_temp layout: (num_experts, max_tokens_per_Expert, d_expert) : (max_tokens_per_expert * d_expert, d_expert, 1)
+    # max_tokens_per_expert : M
+    # d_hidden : K
+    # d_expert : N
+    # grid : (n_experts, cdiv(max_tokens_per_expert, BM) * cdiv(d_expert, BN))
+
+    expert_id = tl.program_id(axis=0)
+
+    pid_expert_flat = tl.program_id(axis=1)
+    num_pid_m = tl.cdiv(max_tokens_per_expert, BLOCKSIZE_M)
+    num_pid_n = tl.cdiv(d_expert, BLOCKSIZE_N)
+    num_pid_in_group = GROUPSIZE_M * num_pid_n
+    group_id = pid_expert_flat // num_pid_in_group
+    first_pid_m = group_id * GROUPSIZE_M
+    group_size_m = min(GROUPSIZE_M, num_pid_m - first_pid_m)
+    pid_m = first_pid_m + (pid_expert_flat % group_size_m)
+    pid_n = (pid_expert_flat % num_pid_in_group) // group_size_m
+
+    start_m = pid_m * BLOCKSIZE_M
+    start_n = pid_n * BLOCKSIZE_N
+
+    offs_am = start_m + tl.arange(0, BLOCKSIZE_M)
+    offs_b0n = start_n + tl.arange(0, BLOCKSIZE_N)           # W_gate
+    offs_b1n = start_n + tl.arange(0, BLOCKSIZE_N)           # W_up
+    m_mask = offs_am < max_tokens_per_expert
+    offs_am = tl.where(m_mask, offs_am, 0)
+    offs_b0n = tl.where(offs_b0n < d_expert, offs_b0n, 0)
+    offs_b1n = tl.where(offs_b1n < d_expert, offs_b1n, 0)
+    offs_k = tl.arange(0, BLOCKSIZE_K)
+    
+
+    x_expert_offset = expert_id * max_tokens_per_expert * d_hidden
+    weight_offset = expert_id * d_hidden * d_expert
+    routed_temp_expert_offset = expert_id * max_tokens_per_expert * d_expert
+    
+    # Pointer Arithmetic
+    a_ptrs = x + x_expert_offset + offs_am[:, None] * d_hidden + offs_k[None, :]               # [BM, BK]
+    b0_ptrs = W_gate + weight_offset + offs_k[:, None] * d_expert + offs_b0n[None, :]          # [BK, BN]
+    b1_ptrs = W_up + weight_offset + offs_k[:, None] * d_expert + offs_b1n[None, :]            # [BK, BN]
+    
+    gate_acc = tl.zeros((BLOCKSIZE_M, BLOCKSIZE_N), dtype=tl.float32)
+    up_acc = tl.zeros((BLOCKSIZE_M, BLOCKSIZE_N), dtype=tl.float32)
+
+    for k in range(0, tl.cdiv(d_hidden, BLOCKSIZE_K)):
+        a = tl.load(a_ptrs, mask= m_mask[:, None] & (offs_k[None, :] < d_hidden - k * BLOCKSIZE_K), other=0.0)
+        b0 = tl.load(b0_ptrs, mask=offs_k[:, None] < d_hidden - k * BLOCKSIZE_K, other=0.0)
+        
+        gate_acc = tl.dot(a, b0, gate_acc, input_precision="ieee")         # [BM, BN]
+
+        b1 = tl.load(b1_ptrs, mask=offs_k[:, None] < d_hidden - k * BLOCKSIZE_K, other=0.0)
+        up_acc = tl.dot(a, b1, up_acc, input_precision="ieee")             # [BM, BN]
+        a_ptrs += BLOCKSIZE_K
+        b0_ptrs += BLOCKSIZE_K * d_expert
+        b1_ptrs += BLOCKSIZE_K * d_expert
+
+    #SiLu
+    gate_acc = gate_acc * tl.sigmoid(gate_acc)
+    temp = gate_acc * up_acc        # [BM,BN]
+    temp = temp.to(tl.float16)
+    # gate_acc_fp16 = gate_acc.to(tl.float16)
+    # up_acc_fp16 = up_acc.to(tl.float16)
+    # silu_gate_fp16 = (gate_acc_fp16 * tl.sigmoid(gate_acc_fp16.to(tl.float32))).to(tl.float16)
+    # temp = silu_gate_fp16 * up_acc_fp16    # [BM, BN], fp16
+
+    offs_cm = start_m + tl.arange(0, BLOCKSIZE_M)
+    offs_cn = start_n + tl.arange(0, BLOCKSIZE_N)
+    c_ptrs = routed_temp + routed_temp_expert_offset + offs_cm[:, None] * d_expert + offs_cn[None, :] 
+    c_mask = (offs_cm[:, None] < max_tokens_per_expert) & (offs_cn[None, :] < d_expert)
+    tl.store(c_ptrs, temp, mask=c_mask)
+
+
+
+@triton.autotune(
+    configs= configs(),
+    key= [],
+)
+@triton.jit
+def down_proj_kernel(
+    W_down,
+    routed_temp,
+    out,
+    max_tokens_per_expert,
+    d_hidden,
+    d_expert,
+    sorted_expert_scores_ptr,
+    dest_row_ptr,
+    expert_counts_ptr,
+    expert_offsets_ptr,
+    BLOCKSIZE_M: tl.constexpr,
+    BLOCKSIZE_N: tl.constexpr,
+    BLOCKSIZE_K: tl.constexpr,
+    GROUPSIZE_M: tl.constexpr,
+):
+    # W_down : (n_routed_experts, d_expert, d_hidden) : (d_expert * d_hidden, d_hidden, 1)
+    # routed_temp layout: (num_experts, max_tokens_per_Expert, d_hidden) : (max_tokens_per_expert * d_hidden, d_hidden, 1)
+    # out layout: (batch_size * seq_len * n_experts_per_token, d_hidden) : (d_hidden, 1)
+    # max_tokens_per_expert : M
+    # d_hidden : N
+    # d_expert : K
+    # sorted_exp_scores : (batch_size * seq_len * n_experts_per_token, ) : (1, 1)
+    # dest_row_ptr : (batch_size * seq_len * n_experts_per_token, )
+    # expert_counts : (num_experts, ) : (1, )
+    # grid : (n_experts, cdiv(max_tokens_per_expert, BM) * cdiv(d_hidden, BN))
+
+    expert_id = tl.program_id(axis=0)
+    expert_count = tl.load(expert_counts_ptr + expert_id)
+    expert_start_offset = tl.load(expert_offsets_ptr + expert_id)
+
+    pid_expert_flat = tl.program_id(axis=1)
+    num_pid_m = tl.cdiv(max_tokens_per_expert, BLOCKSIZE_M)
+    num_pid_n = tl.cdiv(d_expert, BLOCKSIZE_N)
+    num_pid_in_group = GROUPSIZE_M * num_pid_n
+    group_id = pid_expert_flat // num_pid_in_group
+    first_pid_m = group_id * GROUPSIZE_M
+    group_size_m = min(GROUPSIZE_M, num_pid_m - first_pid_m)
+    pid_m = first_pid_m + (pid_expert_flat % group_size_m)
+    pid_n = (pid_expert_flat % num_pid_in_group) // group_size_m
+
+    start_m = pid_m * BLOCKSIZE_M
+    start_n = pid_n * BLOCKSIZE_N
+
+    offs_am = start_m + tl.arange(0, BLOCKSIZE_M)           
+    offs_bn = start_n + tl.arange(0, BLOCKSIZE_N)           # W_down
+    m_mask = offs_am < max_tokens_per_expert
+    n_mask = offs_bn < d_hidden
+    offs_am = tl.where(m_mask, offs_am, 0)
+    offs_bn = tl.where(offs_bn < d_hidden, offs_bn, 0)
+    c_mask = offs_am < expert_count
+    offs_cm = tl.where(c_mask, offs_am, 0)
+    offs_k = tl.arange(0, BLOCKSIZE_K)
+
+    dest_rows = tl.load(dest_row_ptr + expert_start_offset + offs_cm)
+    routed_temp_expert_offset = expert_id * max_tokens_per_expert * d_expert
+    weight_offset = expert_id * d_hidden * d_expert
+    
+    # Pointer Arithmetic
+    expert_scores = tl.load(sorted_expert_scores_ptr + expert_start_offset + offs_cm)
+    a_ptrs = routed_temp + routed_temp_expert_offset + offs_am[:, None] * d_expert + offs_k[None, :]               # [BM, BK]         # [BK, BN]
+    b_ptrs = W_down + weight_offset + offs_k[:, None] * d_hidden + offs_bn[None, :]                    # [BN, BK]
+
+    acc = tl.zeros((BLOCKSIZE_M,BLOCKSIZE_N), dtype=tl.float32)
+    for k in range(0, tl.cdiv(d_expert, BLOCKSIZE_K)):
+        a = tl.load(a_ptrs, mask= m_mask[:, None] & (offs_k[None, :] < d_expert - k * BLOCKSIZE_K), other=0.0)
+        b = tl.load(b_ptrs, mask=offs_k[:, None] < d_expert - k * BLOCKSIZE_K, other=0.0)
+        
+        acc = tl.dot(a, b, acc, input_precision="ieee")         # [BM, BN]
+
+        a_ptrs += BLOCKSIZE_K
+        b_ptrs += BLOCKSIZE_K * d_hidden
+
+    acc = acc * expert_scores[:, None]            # [BM, BK] * [BM, ]
+
+    tl.store(
+        out + dest_rows[:, None] * d_hidden + offs_bn[None, :],
+        acc,
+        mask= c_mask[:, None] & n_mask[None, :],
+    )
+
+
+def _stack_tensor(weights, key_tmpl: str, n):
+    mats = [weights[key_tmpl.format(i)] for i in range(n)]
+    return torch.stack(mats, dim=0).contiguous()
+
+# config: {'d_hidden': 7168, 'd_expert': 2048, 'n_routed_experts': 32, 'n_shared_experts': 1, 'n_experts_per_token': 4, 'batch_size': 1, 'seq_len': 2048}
+# input_tensor layout: (batch_size, seq_len, d_hidden) : (d_hidden * seq_len, d_hidden, 1)
+# router.weight layout: (n_routed_experts,  d_hidden) : (d_hidden, 1)
+# experts.{i}.0.weight layout: (d_hidden, d_expert) : (d_expert, 1)
+# experts.{i}.1.weight layout: (d_hidden, d_expert) : (d_expert, 1)
+# experts.{i}.2.weight layout: (d_expert, d_hidden) : (d_hidden, 1)
+# shared_experts.{i}.0.weight layout: (d_hidden, d_expert * n_shared_experts) : (d_expert * n_shared_experts, 1)
+# shared_experts.{i}.1.weight layout: (d_hidden, d_expert * n_shared_experts) : (d_expert * n_shared_experts, 1)
+# shared_experts.{i}.2.weight layout: (d_expert * n_shared_experts, d_hidden) : (d_hidden, 1)
+def moe_forward(input_tensor: torch.Tensor,
+                weights: Dict[str, torch.Tensor],
+                d_hidden: int,
+                d_expert: int,
+                n_routed_experts: int,
+                n_shared_experts: int,
+                n_experts_per_token: int,
+                batch_size: int,
+                seq_len: int,
+                ) -> torch.Tensor:
+    
+    input_tensor = input_tensor.reshape(-1, d_hidden)
+    num_tokens, _ = input_tensor.shape
+
+    num_experts = n_routed_experts
+
+    # Combined weight tensors for all routed experts
+    W_gate = _stack_tensor(weights, "experts.{}.0.weight", num_experts)
+    # W_gate : (n_routed_experts, d_hidden, d_expert) : (d_hidden * d_expert, d_expert, 1) 
+    W_up = _stack_tensor(weights, "experts.{}.1.weight", num_experts)
+    # W_up : (n_routed_experts, d_hidden, d_expert) : (d_hidden * d_expert, d_expert, 1)
+    W_down = _stack_tensor(weights, "experts.{}.2.weight", num_experts)
+    # W_down : (n_routed_experts, d_expert, d_hidden) : (d_expert * d_hidden, d_hidden, 1)
+
+    # Shared Expert/s
+    shared_w_gate = weights['shared_experts.0.weight']
+    shared_w_up = weights['shared_experts.1.weight']
+    shared_w_down = weights['shared_experts.2.weight']
+
+    shared_temp = F.silu(input_tensor @ shared_w_gate) * (input_tensor @ shared_w_up)     # (batch_size * seq_len, d_expert * n_shared_experts)
+    shared_out = shared_temp @ shared_w_down        # (batch_Size * seq_len, d_hidden)
+
+    logits = F.linear(input_tensor, weights["router.weight"])       # (batch_size * seq_len, n_routed_experts)
+    # print(f"logits dtype : {logits.dtype}")
+    scores = logits.softmax(dim=-1)     # (batch_size * seq_len, n_routed_experts)
+    topk_scores, topk_indices = torch.topk(scores, k=n_experts_per_token, dim=-1, sorted=False)
+    # topk_scores: (batch_size * seq_len, n_experts_per_token)
+    # topk_indices: (batch_size * seq_len, n_experts_per_token)
+    # print(f"topk_scores dtype : {topk_scores.dtype}")
+
+    flat_expert_indices = topk_indices.view(-1)
+    # flat_expert_indices -> (batch_size*seq_len*n_experts_per_token, ) : (1, )
+    flat_expert_scores = topk_scores.view(-1)
+    # flat_expert_scores -> (batch_size*seq_len*n_experts_per_token, 1) : (1, 1)
+    idxs = flat_expert_indices.argsort()    
+    # (batch_size * seq_len * n_experts_per_token, )
+    sorted_expert_ids = flat_expert_indices[idxs]
+    sorted_expert_scores = flat_expert_scores[idxs]
+    token_idxs = idxs // n_experts_per_token  
+    # (batch_size * seq_len * n_experts_per_token, )
+    dest_row = idxs.to(torch.int32)
+    # (batch_size * seq_len * n_experts_per_token, )
+    
+    counts = sorted_expert_ids.to(torch.int32).bincount(minlength=num_experts)      # [num_experts]
+    expert_offsets = torch.zeros_like(counts)
+    expert_offsets[1:] = torch.cumsum(counts[:-1], dim=0)
+    max_tokens_per_expert = counts.max().item()
+
+    sorted_input = input_tensor[token_idxs]   
+    # (batch_size * seq_len * n_experts_per_token, d_hidden)
+
+    batched_input = torch.zeros(size=(num_experts, max_tokens_per_expert, d_hidden),  # type: ignore
+                                device=input_tensor.device,
+                                dtype= input_tensor.dtype)
+
+    sorted_input_token_indices = torch.arange(sorted_input.shape[0], device=input_tensor.device)
+    token_group_offset = expert_offsets[sorted_expert_ids]
+    token_offset_inside_token_group = sorted_input_token_indices - token_group_offset
+    batched_input[sorted_expert_ids, token_offset_inside_token_group, :] = sorted_input
+
+    # kernel 1: gate + up + silu
+    routed_temp = torch.zeros(
+        size= (num_experts, max_tokens_per_expert, d_expert), # type: ignore
+        device= input_tensor.device, dtype= torch.float16,
+    )
+    
+    grid1 = lambda META: (num_experts, triton.cdiv(max_tokens_per_expert, META["BLOCKSIZE_M"]) * triton.cdiv(d_expert, META["BLOCKSIZE_N"]), )
+    gate_up_silu_kernel[grid1](
+        W_gate,
+        W_up,
+        batched_input,
+        routed_temp,
+        max_tokens_per_expert,
+        d_hidden,
+        d_expert,
+    )
+
+    # kernel 2: down -rojection
+    routed_out = torch.zeros(
+        size=(num_tokens * n_experts_per_token, d_hidden),
+        device= input_tensor.device,
+        dtype= torch.float32,
+    )
+    grid2 = lambda META: (num_experts, triton.cdiv(max_tokens_per_expert, META["BLOCKSIZE_M"]) * triton.cdiv(d_hidden, META["BLOCKSIZE_N"]), )
+    down_proj_kernel[grid2](
+        W_down,
+        routed_temp,
+        routed_out,
+        max_tokens_per_expert,
+        d_hidden,
+        d_expert,
+        sorted_expert_scores,
+        dest_row,
+        counts,
+        expert_offsets,
+    )
+ 
+    routed_out = routed_out.view(num_tokens, n_experts_per_token, d_hidden).sum(dim=1).to(torch.float16)
+    
+    return (shared_out + routed_out).reshape(batch_size, seq_len, d_hidden)
+
+
+def custom_kernel(data: input_t) -> output_t: # type: ignore
+
+    input_tensor, weights, config = data
+    output = moe_forward(input_tensor, weights, **config)
+
+    return output # type: ignore
+
+
+def profile_moe():
+    # Configuration values
+    dhidden = 7168
+    dexpert = 2048
+    nroutedexperts = 8
+    nsharedexperts = 1
+    nexpertspertoken = 4
+    bs = 2
+    seqlen = 8192
+    seed = 81934
+
+    # Generate input, weights, config
+    input_tensor, weights, config = generate_input(
+        dhidden,
+        dexpert,
+        nroutedexperts,
+        nsharedexperts,
+        nexpertspertoken,
+        bs,
+        seqlen,
+        seed
+    )
+
+    def step():
+        with torch.profiler.record_function("moe_fwd"):
+            return custom_kernel((input_tensor, weights, config))
+        
+    for _ in range(3):
+        step()
+    torch.cuda.synchronize()
+    
+    schedule = torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=1)
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        schedule= schedule,
+        record_shapes=False,
+        profile_memory=False,
+        with_stack=False,
+    ) as prof:
+        for _ in range(5):
+            step()
+            prof.step()
+    torch.cuda.synchronize()
+
+    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=30))
+    prof.export_chrome_trace("moe_profile.json")
+
+def run_test(expect, actual, enabled=True):
+    if enabled:
+        passed = torch.allclose(expect, actual, atol=1e-2, rtol=0)
+        if passed:
+            print("✅ Triton and Torch match")
+        else:
+            print("❌ Triton and Torch differ")
+    else:
+        icon = "⭕"
+        print(f"\r  Disabled: {icon}  ")
+
+if __name__ == "__main__":
+    torch.cuda.set_device(0)
+    dhidden = 512
+    dexpert = 128
+    nroutedexperts = 4
+    nsharedexperts = 1
+    nexpertspertoken = 2
+    bs = 2
+    seqlen = 8
+    seed = 81934
+
+    input_tensor, weights, config = generate_input(
+        dhidden,
+        dexpert,
+        nroutedexperts,
+        nsharedexperts,
+        nexpertspertoken,
+        bs,
+        seqlen,
+        seed
+    )
+    print("Input tensor shape:", input_tensor.shape)
+    # print("Weights dictionary keys:", list(weights.keys()))
+    for key, value in weights.items():
+        print(f"{key}: {value.shape}")
+    print("Config dictionary:", config)
+
+    my_moe_out = custom_kernel((input_tensor, weights, config))
+    ref_moe_out = ref_custom_kernel((input_tensor, weights, config))
+    diff = torch.abs(my_moe_out - ref_moe_out)
+    print("Reference MoE output shape,dtype:", ref_moe_out.shape, ref_moe_out.dtype)
+    print("My MoE output shape, dtype", my_moe_out.shape, my_moe_out.dtype)
+    run_test(my_moe_out, ref_moe_out)
+    print(f"Final difference: {diff}")
+
+    
+
+    # profiel the custom kernel
+    # profile_moe()
