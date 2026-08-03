@@ -246,7 +246,7 @@ def generate_input(
     return (input_tensor, weights, config)
 
 def num_sms():
-    return 16
+    return 2 * 304
 
 def configs():
     return [

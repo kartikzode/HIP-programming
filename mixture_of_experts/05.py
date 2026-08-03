@@ -246,7 +246,7 @@ def generate_input(
     return (input_tensor, weights, config)
 
 def num_sms():
-    return 16
+    return 2 * 304
 
 def configs():
     return [
@@ -579,28 +579,26 @@ def permute_for_experts_custom(
     grid = (num_experts, )
     tokens_per_program = ceil_div(numel, num_experts)
 
-    count_token2expert_per_chunck[grid](
+    count_token2expert_per_chunck[grid]( 
         expert_indices,
         token_counts,
-        num_experts,
-        numel,
-        tokens_per_program 
+        num_experts, numel, tokens_per_program          # type: ignore 
     )
 
     count_accumulate_per_expert[grid](
         token_counts,
-        num_experts,
+        num_experts,            # type: ignore
     )
 
     cumsum_populate[1, ](
         token_counts,
         cumsum,
-        num_experts,
+        num_experts,            # type: ignore
     )
 
     scatter_tokens_to_slots[grid](
         expert_indices, token_counts, cumsum, dest_row,
-        num_experts, numel, tokens_per_program,
+        num_experts, numel, tokens_per_program,             # type: ignore
     )
 
     counts = token_counts[num_experts, :].contiguous()
